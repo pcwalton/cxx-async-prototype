@@ -1,0 +1,14 @@
+[package]
+name = "cxx-async"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cxx = "1"
+delegate = "0.6"
+futures = "0.3"
+
+[build-dependencies]
+cxx-build = "1"
