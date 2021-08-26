@@ -6,8 +6,8 @@
 #include "cxx_async.h"
 #include "rust/cxx.h"
 
-struct RustReceiverI32;
+struct RustOneshotI32;
 
-rust::Box<RustReceiverI32> my_async_operation();
+rust::Box<RustOneshotI32> my_async_operation();
 
 #endif
