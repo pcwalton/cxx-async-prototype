@@ -3,8 +3,7 @@
 fn main() {
     cxx_build::bridge("src/main.rs")
         .file("src/example.cpp")
-        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-std=c++20")
         .include("include")
-        .include("cxx-async/src")
         .compile("cxx-async");
 }
