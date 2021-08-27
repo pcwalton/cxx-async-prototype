@@ -6,8 +6,10 @@
 #include "cxx_async.h"
 #include "rust/cxx.h"
 
+struct RustOneshotF64;
 struct RustOneshotI32;
 
+rust::Box<RustOneshotF64> dot_product();
 rust::Box<RustOneshotI32> my_async_operation();
 
 #endif
