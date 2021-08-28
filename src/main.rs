@@ -9,6 +9,7 @@ use std::cell::UnsafeCell;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
+use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -41,7 +42,7 @@ macro_rules! define_oneshot {
 
                 unsafe fn poll_with_coroutine_handle(&mut self,
                                                      maybe_result: *mut f64,
-                                                     coroutine_address: *mut c_void)
+                                                     coroutine_address: *mut u8)
                                                      -> bool {
                     self.0
                         .lock()
@@ -68,6 +69,7 @@ macro_rules! define_oneshot {
 
 #[cxx::bridge]
 mod ffi {
+    /*
     // Boilerplate for I32
     extern "Rust" {
         type RustOneshotI32;
@@ -75,6 +77,7 @@ mod ffi {
         fn clone_box(self: &RustOneshotI32) -> Box<RustOneshotI32>;
         fn make(self: &RustOneshotI32) -> Box<RustOneshotI32>;
     }
+    */
 
     // Boilerplate for F64
     extern "Rust" {
@@ -105,7 +108,7 @@ mod ffi {
     }
 }
 
-define_oneshot!(I32, i32);
+//define_oneshot!(I32, i32);
 define_oneshot!(F64, f64);
 
 struct RustOneshotImpl<T> {
@@ -149,16 +152,17 @@ impl<T> RustOneshotImpl<T> {
         }
     }
 
-    unsafe fn poll_with_coroutine_handle(mut self: Pin<&mut Self>,
-                                         maybe_result: *mut f64,
+    unsafe fn poll_with_coroutine_handle(&mut self,
+                                         maybe_result: *mut T,
                                          coroutine_address: *mut u8)
                                          -> bool {
         let waker = CxxCoroutineAddress(UnsafeCell::new(coroutine_address)).into_waker();
-        match self.receiver.poll(&mut Context::from_waker(&waker)) {
-            Poll::Ready(result) => {
+        match Pin::new(&mut self.receiver).poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(Ok(result)) => {
                 *maybe_result = result;
                 true
             }
+            Poll::Ready(Err(_)) => todo!(),
             Poll::Pending => false,
         }
     }
@@ -168,36 +172,40 @@ struct CxxCoroutineAddress(UnsafeCell<*mut u8>);
 
 impl CxxCoroutineAddress {
     unsafe fn into_waker(self) -> Waker {
-        let boxed_coroutine_address = Arc::new(self);
-        return Waker::from_raw(RawWaker::new(
-            Arc::into_raw(boxed_coroutine_address) as *const u8 as *const (), &VTABLE));
+        return Waker::from_raw(make_raw_waker(Arc::new(self)));
 
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
+
+        fn make_raw_waker(boxed_coroutine_address: Arc<CxxCoroutineAddress>) -> RawWaker {
+            RawWaker::new(
+                Arc::into_raw(boxed_coroutine_address) as *const u8 as *const (),
+                &VTABLE)
+        }
 
         unsafe fn clone(boxed_coroutine_address: *const ()) -> RawWaker {
             let boxed_coroutine_address = Arc::from_raw(
                 boxed_coroutine_address as *const CxxCoroutineAddress);
             mem::forget(boxed_coroutine_address.clone());
-            Arc::into_raw(boxed_coroutine_address)
+            make_raw_waker(boxed_coroutine_address)
         }
 
         unsafe fn wake(boxed_coroutine_address: *const ()) {
             let boxed_coroutine_address = Arc::from_raw(
                 boxed_coroutine_address as *const CxxCoroutineAddress);
-            let address = boxed_coroutine_address.0.get_mut();
-            rust_resume_cxx_coroutine(mem::replace(address, ptr::null_mut()));
+            let address = boxed_coroutine_address.0.get();
+            ffi::rust_resume_cxx_coroutine(mem::replace(&mut *address, ptr::null_mut()));
             let _ = boxed_coroutine_address;
         }
 
         unsafe fn wake_by_ref(boxed_coroutine_address: *const ()) {
             let boxed_coroutine_address = Arc::from_raw(
                 boxed_coroutine_address as *const CxxCoroutineAddress);
-            let address = boxed_coroutine_address.0.get_mut();
-            rust_resume_cxx_coroutine(mem::replace(address, ptr::null_mut()));
+            let address = boxed_coroutine_address.0.get();
+            ffi::rust_resume_cxx_coroutine(mem::replace(&mut *address, ptr::null_mut()));
             mem::forget(boxed_coroutine_address);
         }
 
-        unsafe fn drop(boxed_coroutine_address: *const ()) {
+        unsafe fn drop_waker(boxed_coroutine_address: *const ()) {
             let _ = Arc::from_raw(boxed_coroutine_address as *const CxxCoroutineAddress);
         }
     }
@@ -206,7 +214,8 @@ impl CxxCoroutineAddress {
 impl Drop for CxxCoroutineAddress {
     fn drop(&mut self) {
         unsafe {
-            rust_destroy_cxx_coroutine(self.0);
+            let address = self.0.get();
+            ffi::rust_destroy_cxx_coroutine(mem::replace(&mut *address, ptr::null_mut())) 
         }
     }
 }
@@ -239,14 +248,16 @@ fn rust_dot_product() -> Box<RustOneshotF64> {
     return oneshot;
 
     async fn go(mut oneshot: Box<RustOneshotF64>) {
-        oneshot.send(dot_product_inner(&VECTOR_A, &VECTOR_B).await);
+        let result = dot_product_inner(&VECTOR_A, &VECTOR_B).await;
+        println!("{}", result);
+        oneshot.send(result);
     }
 }
 
 fn main() {
     // Test Rust calling C++ async functions.
-    let receiver = ffi::dot_product();
-    println!("{}", executor::block_on(receiver));
+    //let receiver = ffi::dot_product();
+    //println!("{}", executor::block_on(receiver));
 
     // Test C++ calling Rust async functions.
     ffi::call_rust_dot_product();

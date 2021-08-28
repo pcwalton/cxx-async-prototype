@@ -48,7 +48,7 @@ public:
     public:
         Awaiter(rust::Box<Oneshot> &&oneshot) : m_oneshot(std::move(oneshot)), m_result() {}
 
-        bool await_ready() const noexcept {
+        bool await_ready() noexcept {
             // Already have the result?
             if (m_result)
                 return true;
@@ -63,23 +63,30 @@ public:
             return true;
         }
 
-        void await_suspend(std::experimental::coroutine_handle<void> next) const {
+        void await_suspend(std::experimental::coroutine_handle<void> next) {
             MaybeResult maybe_result;
-            bool ready = m_oneshot->poll_with_coroutine_handle(&maybe_result.some, next.address());
-            if (!ready)
+            bool ready = m_oneshot->poll_with_coroutine_handle(
+                &maybe_result.some,
+                reinterpret_cast<uint8_t *>(next.address()));
+            if (!ready) {
+                std::cout << "going to sleep!" << std::endl;
                 return;
+            }
             m_result = std::move(maybe_result.some);
             maybe_result.some.~Result();
             next();
         }
 
-        Result await_resume() { return *m_result; }
+        Result await_resume() {
+            // Kinda hacky...
+            await_ready();
+            return *m_result;
+        }
 
     private:
         rust::Box<Oneshot> m_oneshot;
         std::optional<Result> m_result;
     };
-
 
 private:
     rust::Box<Oneshot> m_oneshot;
@@ -113,8 +120,8 @@ struct std::experimental::coroutine_traits<rust::Box<RustOneshotF64>, Args...> {
 };
 
 template<>
-//struct cppcoro::awaitable_traits<rust::Box<RustOneshotF64> &> {
-struct cppcoro::awaitable_traits<RustOneshotPromise<RustOneshotF64, double>::Awaiter &> {
+struct cppcoro::awaitable_traits<rust::Box<RustOneshotF64> &&> {
+//struct cppcoro::awaitable_traits<RustOneshotPromise<RustOneshotF64, double>::Awaiter &> {
     typedef double await_result_t;
 };
 
@@ -156,6 +163,6 @@ rust::Box<RustOneshotF64> dot_product() {
 
 void call_rust_dot_product() {
     rust::Box<RustOneshotF64> oneshot = rust_dot_product();
-    double result = cppcoro::sync_wait(oneshot);
+    double result = cppcoro::sync_wait(std::move(oneshot));
     std::cout << result << std::endl;
 }
