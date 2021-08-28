@@ -14,6 +14,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <thread>
 #include <type_traits>
@@ -22,8 +23,14 @@
 #define SPLIT_LIMIT     32
 #define ARRAY_SIZE      16384
 
+// FIXME(pcwalton): This should use a traits struct.
 template<typename Oneshot, typename Result>
 struct RustOneshotPromise {
+    // Require destructor to be called manually.
+    union MaybeResult {
+        Result some;
+    };
+
 public:
     RustOneshotPromise() : m_oneshot(static_cast<Oneshot *>(nullptr)->make()) {}
 
@@ -34,17 +41,66 @@ public:
     std::experimental::suspend_never initial_suspend() const noexcept { return {}; }
     std::experimental::suspend_never final_suspend() const noexcept { return {}; }
 
-    void return_value(const Result &value) {
-        m_oneshot->set_value(value);
-    }
+    void return_value(const Result &value) { m_oneshot->send(value); }
+    void unhandled_exception() noexcept { /* TODO */ }
 
-    void unhandled_exception() noexcept {
-        // TODO
-    }
+    struct Awaiter {
+    public:
+        Awaiter(rust::Box<Oneshot> &&oneshot) : m_oneshot(std::move(oneshot)), m_result() {}
+
+        bool await_ready() const noexcept {
+            // Already have the result?
+            if (m_result)
+                return true;
+
+            // Try to receive the result.
+            MaybeResult maybe_result;
+            bool ready = m_oneshot->try_recv(&maybe_result.some);
+            if (!ready)
+                return false;
+            m_result = std::move(maybe_result.some);
+            maybe_result.some.~Result();
+            return true;
+        }
+
+        void await_suspend(std::experimental::coroutine_handle<void> next) const {
+            MaybeResult maybe_result;
+            bool ready = m_oneshot->poll_with_coroutine_handle(&maybe_result.some, next.address());
+            if (!ready)
+                return;
+            m_result = std::move(maybe_result.some);
+            maybe_result.some.~Result();
+            next();
+        }
+
+        Result await_resume() { return *m_result; }
+
+    private:
+        rust::Box<Oneshot> m_oneshot;
+        std::optional<Result> m_result;
+    };
+
 
 private:
     rust::Box<Oneshot> m_oneshot;
 };
+
+void rust_resume_cxx_coroutine(uint8_t *coroutine_address) {
+    std::experimental::coroutine_handle<void>::from_address(
+        static_cast<void *>(coroutine_address)).resume();
+}
+
+void rust_destroy_cxx_coroutine(uint8_t *coroutine_address) {
+    if (coroutine_address != nullptr) {
+        std::experimental::coroutine_handle<void>::from_address(
+            static_cast<void *>(coroutine_address)).destroy();
+    }
+}
+
+RustOneshotPromise<RustOneshotF64, double>::Awaiter operator co_await(
+        rust::Box<RustOneshotF64> &&oneshot) noexcept {
+    return RustOneshotPromise<RustOneshotF64, double>::Awaiter(std::move(oneshot));
+}
 
 template<typename... Args>
 struct std::experimental::coroutine_traits<rust::Box<RustOneshotI32>, Args...> {
@@ -54,6 +110,12 @@ struct std::experimental::coroutine_traits<rust::Box<RustOneshotI32>, Args...> {
 template<typename... Args>
 struct std::experimental::coroutine_traits<rust::Box<RustOneshotF64>, Args...> {
     using promise_type = RustOneshotPromise<RustOneshotF64, double>;
+};
+
+template<>
+//struct cppcoro::awaitable_traits<rust::Box<RustOneshotF64> &> {
+struct cppcoro::awaitable_traits<RustOneshotPromise<RustOneshotF64, double>::Awaiter &> {
+    typedef double await_result_t;
 };
 
 cppcoro::task<double> dot_product_inner(cppcoro::static_thread_pool &thread_pool,
@@ -92,128 +154,8 @@ rust::Box<RustOneshotF64> dot_product() {
     co_return co_await cppcoro::schedule_on(thread_pool, dot_product_on(thread_pool));
 }
 
-#ifdef MINITASK
-// Task implementation
-template<typename T>
-struct task {
-    struct promise_type {
-        T m_result;
-        std::experimental::coroutine_handle<> m_prev;
-
-        task get_return_object() noexcept {
-            return {std::experimental::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-
-        std::experimental::suspend_never initial_suspend() const noexcept { return {}; }
-
-        auto final_suspend() const noexcept {
-            struct awaiter {
-                bool await_ready() const noexcept { return false; }
-                void await_resume() const noexcept {}
-                std::experimental::coroutine_handle<> await_suspend(
-                        std::experimental::coroutine_handle<promise_type> coro) noexcept {
-                    auto prev = coro.promise().m_prev;
-                    if (prev)
-                        return prev;
-                    return std::experimental::noop_coroutine();
-                }
-            };
-            return awaiter {};
-        }
-
-        void return_value(T value) noexcept { m_result = std::move(value); }
-
-        void unhandled_exception() noexcept {
-            // TODO
-        }
-    };
-
-    std::experimental::coroutine_handle<promise_type> m_handle;
-
-    bool await_ready() const noexcept { return m_handle.done(); }
-    T await_resume() const noexcept { return std::move(m_handle.promise().m_result); }
-    void await_suspend(std::experimental::coroutine_handle<> prev) const noexcept {
-        m_handle.promise().m_prev = prev;
-    }
-};
-#endif
-
-#if 0
-struct RustReceiverAwaiter {
-private:
-    rust::Box<RustReceiverI32> m_receiver;
-public:
-    RustReceiverAwaiter(rust::Box<RustReceiverI32> &&receiver) : m_receiver(std::move(receiver)) {}
-    bool await_ready() const noexcept {
-        return false;
-    }
-    void await_suspend(std::experimental::coroutine_handle<> continuation) const {
-        // TODO
-    }
-    int32_t await_resume() {
-        // TODO
-    }
-};
-#endif
-
-#if 0
-// Allow co_await'ing std::future<T> and std::future<void>
-// by naively spawning a new thread for each co_await.
-template <typename T>
-auto operator co_await(std::future<T> future) noexcept
-requires(!std::is_reference_v<T>) {
-  struct awaiter : std::future<T> {
-    bool await_ready() const noexcept {
-      using namespace std::chrono_literals;
-      return this->wait_for(0s) != std::future_status::timeout;
-    }
-    void await_suspend(std::experimental::coroutine_handle<> cont) const {
-      std::thread([this, cont] {
-        std::experimental::coroutine_handle<> my_cont = std::move(cont);
-        this->wait();
-        my_cont();
-      }).detach();
-    }
-    T await_resume() { return this->get(); }
-  };
-  return awaiter{std::move(future)};
+void call_rust_dot_product() {
+    rust::Box<RustOneshotF64> oneshot = rust_dot_product();
+    double result = cppcoro::sync_wait(oneshot);
+    std::cout << result << std::endl;
 }
-#endif
-
-cppcoro::task<int32_t> return_six() noexcept { co_return 6; }
-cppcoro::task<int32_t> return_seven() noexcept { co_return 7; }
-
-rust::Box<RustOneshotI32> my_async_operation() {
-    int a = co_await return_six();
-    int b = co_await return_seven();
-    co_return a * b;
-}
-
-#if 0
-RustReceiverAwaiter operator co_await(rust::Box<RustReceiverI32> &&receiver) noexcept {
-    return RustReceiverAwaiter(std::move(receiver));
-}
-
-rust::Box<RustReceiverI32> just_return(int32_t value) {
-    RustChannelI32 channel = make_channel();
-    channel.sender->set_value(value);
-    return std::move(channel.receiver);
-}
-#endif
-
-/*
-void sleeper(rust::Box<RustSenderI32> sender) {
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    std::cout << "waking up 0" << std::endl;
-    sender->set_value(1);
-}
-
-rust::Box<RustReceiverI32> my_async_operation() {
-    RustChannelI32 channel = make_channel();
-    std::thread thread(sleeper, std::move(channel.sender));
-    thread.detach();
-    rust::Box<RustReceiverI32> future = std::move(channel.receiver);
-    int32_t result = co_await future;
-    co_return result;
-}
-*/
