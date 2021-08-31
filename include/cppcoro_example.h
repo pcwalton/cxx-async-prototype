@@ -6,10 +6,9 @@
 #include "cxx_async.h"
 #include "rust/cxx.h"
 
-struct RustOneshotF64;
-struct RustOneshotI32;
+struct RustOneshotReceiverF64;
 
-rust::Box<RustOneshotF64> dot_product();
+rust::Box<RustOneshotReceiverF64> dot_product();
 void call_rust_dot_product();
 
 #endif

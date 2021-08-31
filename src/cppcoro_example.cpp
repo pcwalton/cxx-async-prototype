@@ -9,6 +9,7 @@
 #include <cppcoro/task.hpp>
 #include <cppcoro/when_all.hpp>
 #include <experimental/coroutine>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <future>
@@ -23,75 +24,6 @@
 #define SPLIT_LIMIT     32
 #define ARRAY_SIZE      16384
 
-// FIXME(pcwalton): This should use a traits struct.
-template<typename Oneshot, typename Result>
-struct RustOneshotPromise {
-    // Require destructor to be called manually.
-    union MaybeResult {
-        Result some;
-    };
-
-public:
-    RustOneshotPromise() : m_oneshot(static_cast<Oneshot *>(nullptr)->make()) {}
-
-    rust::Box<Oneshot> get_return_object() noexcept {
-        return m_oneshot->clone_box();
-    }
-
-    std::experimental::suspend_never initial_suspend() const noexcept { return {}; }
-    std::experimental::suspend_never final_suspend() const noexcept { return {}; }
-
-    void return_value(const Result &value) { m_oneshot->send(value); }
-    void unhandled_exception() noexcept { /* TODO */ }
-
-    struct Awaiter {
-    public:
-        Awaiter(rust::Box<Oneshot> &&oneshot) : m_oneshot(std::move(oneshot)), m_result() {}
-
-        bool await_ready() noexcept {
-            // Already have the result?
-            if (m_result)
-                return true;
-
-            // Try to receive the result.
-            MaybeResult maybe_result;
-            bool ready = m_oneshot->try_recv(&maybe_result.some);
-            if (!ready)
-                return false;
-            m_result = std::move(maybe_result.some);
-            maybe_result.some.~Result();
-            return true;
-        }
-
-        void await_suspend(std::experimental::coroutine_handle<void> next) {
-            MaybeResult maybe_result;
-            bool ready = m_oneshot->poll_with_coroutine_handle(
-                &maybe_result.some,
-                reinterpret_cast<uint8_t *>(next.address()));
-            if (!ready) {
-                std::cout << "going to sleep!" << std::endl;
-                return;
-            }
-            m_result = std::move(maybe_result.some);
-            maybe_result.some.~Result();
-            next();
-        }
-
-        Result await_resume() {
-            // Kinda hacky...
-            await_ready();
-            return *m_result;
-        }
-
-    private:
-        rust::Box<Oneshot> m_oneshot;
-        std::optional<Result> m_result;
-    };
-
-private:
-    rust::Box<Oneshot> m_oneshot;
-};
-
 void rust_resume_cxx_coroutine(uint8_t *coroutine_address) {
     std::experimental::coroutine_handle<void>::from_address(
         static_cast<void *>(coroutine_address)).resume();
@@ -104,26 +36,134 @@ void rust_destroy_cxx_coroutine(uint8_t *coroutine_address) {
     }
 }
 
-RustOneshotPromise<RustOneshotF64, double>::Awaiter operator co_await(
-        rust::Box<RustOneshotF64> &&oneshot) noexcept {
-    return RustOneshotPromise<RustOneshotF64, double>::Awaiter(std::move(oneshot));
+// Given a channel type, fetches the receiver type.
+template<typename Channel>
+using RustOneshotReceiverFor =
+    typename decltype(static_cast<Channel *>(nullptr)->receiver)::element_type;
+
+// Given a channel type, fetches the sender type.
+template<typename Channel>
+using RustOneshotSenderFor =
+    typename decltype(static_cast<Channel *>(nullptr)->sender)::element_type;
+
+// Given a receiver type, fetches the channel type.
+template<typename Receiver>
+using RustOneshotChannelFor = decltype(static_cast<Receiver *>(nullptr)->channel());
+
+// Given a channel type, fetches the result type.
+//
+// This extracts the type of the `value` parameter from the `send` method using the technique
+// described here: https://stackoverflow.com/a/28033314
+template<typename Fn>
+struct RustOneshotGetResultTypeFromSendFn;
+template<typename Sender, typename TheResult>
+struct RustOneshotGetResultTypeFromSendFn<void (Sender::*)(TheResult) noexcept> {
+    typedef TheResult Result;
+};
+template<typename Channel>
+using RustOneshotResultFor = typename
+    RustOneshotGetResultTypeFromSendFn<decltype(&RustOneshotSenderFor<Channel>::send)>::Result;
+
+template<typename Channel>
+struct RustOneshotChannelTraits {};
+
+template<typename Channel>
+class RustOneshotAwaiter {
+    typedef RustOneshotReceiverFor<Channel> Receiver;
+    typedef RustOneshotResultFor<Channel> Result;
+
+    // Tries to receive a value. If a value is ready, this method places it in `m_result` and
+    // returns true. If no value is ready, this method returns false.
+    //
+    // If `next` is supplied, this method ensures that it will be called when a value becomes
+    // ready. If the value is available right now, then this method calls `next` immediately.
+    bool try_recv(std::optional<std::experimental::coroutine_handle<void>> next =
+            std::optional<std::experimental::coroutine_handle<void>>()) noexcept {
+        // Require destructor to be called manually.
+        union MaybeResult {
+            Result some;
+        };
+
+        uint8_t *coroutine_address = nullptr;
+        if (next)
+            coroutine_address = reinterpret_cast<uint8_t *>(next->address());
+
+        MaybeResult maybe_result;
+        bool ready = m_receiver->recv(&maybe_result.some, coroutine_address);
+        if (!ready)
+            return false;
+
+        m_result = std::move(maybe_result.some);
+        maybe_result.some.~Result();
+        if (next)
+            (*next)();
+        return true;
+    }
+
+public:
+    RustOneshotAwaiter(rust::Box<Receiver> &&receiver) :
+        m_receiver(std::move(receiver)), m_result() {}
+
+    bool await_ready() noexcept {
+        return m_result || try_recv();
+    }
+
+    void await_suspend(std::experimental::coroutine_handle<void> next) {
+        try_recv(std::move(next));
+    }
+
+    Result await_resume() {
+        bool ready = try_recv();
+        assert(ready);
+        return *std::move(m_result);
+    }
+
+    rust::Box<Receiver> m_receiver;
+    std::optional<Result> m_result;
+};
+
+template<typename Receiver>
+auto operator co_await(rust::Box<Receiver> &&receiver) noexcept {
+    return RustOneshotAwaiter<RustOneshotChannelFor<Receiver>>(std::move(receiver));
 }
 
-template<typename... Args>
-struct std::experimental::coroutine_traits<rust::Box<RustOneshotI32>, Args...> {
-    using promise_type = RustOneshotPromise<RustOneshotI32, int32_t>;
+template<typename Receiver>
+struct cppcoro::awaitable_traits<rust::Box<Receiver> &&> {
+    typedef RustOneshotResultFor<RustOneshotChannelFor<Receiver>> await_result_t;
 };
 
-template<typename... Args>
-struct std::experimental::coroutine_traits<rust::Box<RustOneshotF64>, Args...> {
-    using promise_type = RustOneshotPromise<RustOneshotF64, double>;
+template<typename Channel>
+class RustOneshotPromise {
+public:
+    RustOneshotPromise() :
+        m_channel(static_cast<RustOneshotReceiverFor<Channel> *>(nullptr)->channel()) {}
+
+    auto get_return_object() noexcept {
+        return std::move(m_channel.receiver);
+    }
+
+    std::experimental::suspend_never initial_suspend() const noexcept { return {}; }
+    std::experimental::suspend_never final_suspend() const noexcept { return {}; }
+
+    void return_value(const RustOneshotResultFor<Channel> &value) {
+        m_channel.sender->send(value);
+    }
+
+    void unhandled_exception() noexcept { /* TODO */ }
+
+    Channel m_channel;
 };
+
+template<typename Receiver, typename... Args>
+struct std::experimental::coroutine_traits<rust::Box<Receiver>, Args...> {
+    typedef decltype(static_cast<Receiver *>(nullptr)->channel()) Channel;
+    using promise_type = RustOneshotPromise<Channel>;
+};
+
+// Application code follows:
 
 template<>
-struct cppcoro::awaitable_traits<rust::Box<RustOneshotF64> &&> {
-//struct cppcoro::awaitable_traits<RustOneshotPromise<RustOneshotF64, double>::Awaiter &> {
-    typedef double await_result_t;
-};
+struct RustOneshotChannelTraits<RustOneshotChannelF64> {};
 
 cppcoro::task<double> dot_product_inner(cppcoro::static_thread_pool &thread_pool,
                                         double a[],
@@ -156,13 +196,13 @@ cppcoro::task<double> dot_product_on(cppcoro::static_thread_pool &thread_pool) {
     co_return co_await dot_product_inner(thread_pool, &array_a[0], &array_b[0], array_a.size());
 }
 
-rust::Box<RustOneshotF64> dot_product() {
+rust::Box<RustOneshotReceiverF64> dot_product() {
     static cppcoro::static_thread_pool thread_pool;
     co_return co_await cppcoro::schedule_on(thread_pool, dot_product_on(thread_pool));
 }
 
 void call_rust_dot_product() {
-    rust::Box<RustOneshotF64> oneshot = rust_dot_product();
-    double result = cppcoro::sync_wait(std::move(oneshot));
+    rust::Box<RustOneshotReceiverF64> oneshot_receiver = rust_dot_product();
+    double result = cppcoro::sync_wait(std::move(oneshot_receiver));
     std::cout << result << std::endl;
 }
