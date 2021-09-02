@@ -2,19 +2,44 @@
 
 use crate::ffi::RustOneshotChannelF64;
 use async_recursion::async_recursion;
-use futures::channel::oneshot::{self, Receiver, Sender};
+use cxx::CxxString;
+use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
 use futures::executor::{self, ThreadPool};
 use futures::join;
 use futures::task::SpawnExt;
 use std::cell::UnsafeCell;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::future::Future;
-use std::mem;
+use std::mem::{self, MaybeUninit};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 const SPLIT_LIMIT: usize = 32;
+
+const RECV_RESULT_PENDING: i32 = 0;
+const RECV_RESULT_READY: i32 = 1;
+const RECV_RESULT_ERROR: i32 = 2;
+
+#[derive(Debug)]
+pub struct CxxAsyncException {
+    what: Box<str>,
+}
+
+impl CxxAsyncException {
+    pub fn new(what: Box<str>) -> Self { Self { what } }
+    pub fn what(&self) -> &str { &self.what }
+}
+
+impl Display for CxxAsyncException {
+    fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
+        formatter.write_str(&self.what)
+    }
+}
+
+impl Error for CxxAsyncException {}
 
 struct CxxCoroutineAddress(UnsafeCell<*mut u8>);
 
@@ -80,17 +105,19 @@ mod ffi {
     extern "Rust" {
         type RustOneshotSenderF64;
         type RustOneshotReceiverF64;
-        fn send(self: &mut RustOneshotSenderF64, value: f64);
+        unsafe fn send(self: &mut RustOneshotSenderF64, value: *const f64, error: &str);
         unsafe fn recv(
             self: &mut RustOneshotReceiverF64,
             maybe_result: *mut f64,
+            error: Pin<&mut CxxString>,
             coroutine_address: *mut u8,
-        ) -> bool;
+        ) -> i32;
         fn channel(self: &RustOneshotReceiverF64) -> RustOneshotChannelF64;
     }
 
     extern "Rust" {
         fn rust_dot_product() -> Box<RustOneshotReceiverF64>;
+        fn rust_not_product() -> Box<RustOneshotReceiverF64>;
     }
 
     unsafe extern "C++" {
@@ -102,19 +129,32 @@ mod ffi {
 
         fn dot_product() -> Box<RustOneshotReceiverF64>;
         fn call_rust_dot_product();
+        fn not_product() -> Box<RustOneshotReceiverF64>;
+        fn call_rust_not_product();
     }
 }
 
 macro_rules! define_oneshot {
     ($name:ident, $ty:ty) => {
         paste::paste! {
-            pub struct [<RustOneshotSender $name>](Option<Sender<$ty>>);
+            pub type [<RustOneshotType $name>] = Result<$ty, CxxAsyncException>;
 
-            pub struct [<RustOneshotReceiver $name>](Receiver<$ty>);
+            pub struct [<RustOneshotSender $name>](Option<Sender<[<RustOneshotType $name>]>>);
+
+            pub struct [<RustOneshotReceiver $name>](Receiver<[<RustOneshotType $name>]>);
 
             impl [<RustOneshotSender $name>] {
-                pub fn send(&mut self, value: $ty) {
-                    self.0.take().unwrap().send(value).unwrap();
+                unsafe fn send(&mut self, value: *const $ty, error: &str) {
+                    let to_send;
+                    if !value.is_null() {
+                        let mut staging: MaybeUninit<$ty> = MaybeUninit::uninit();
+                        ptr::copy_nonoverlapping(value, staging.as_mut_ptr(), 1);
+                        to_send = Ok(staging.assume_init());
+                    } else {
+                        to_send = Err(CxxAsyncException::new(error.to_owned().into_boxed_str()));
+                    }
+                    
+                    self.0.take().unwrap().send(to_send).unwrap();
                 }
             }
 
@@ -127,37 +167,55 @@ macro_rules! define_oneshot {
                     }
                 }
 
-                unsafe fn recv(&mut self, maybe_result: *mut $ty, coroutine_address: *mut u8)
-                        -> bool {
+                unsafe fn recv(&mut self,
+                               maybe_result: *mut $ty,
+                               error: Pin<&mut CxxString>,
+                               coroutine_address: *mut u8)
+                               -> i32 {
                     if coroutine_address.is_null() {
                         match self.0.try_recv() {
-                            Ok(Some(result)) => {
+                            Ok(Some(Ok(result))) => {
                                 *maybe_result = result;
-                                return true
+                                return RECV_RESULT_READY
                             }
-                            Ok(None) | Err(_) => return false,
+                            Ok(Some(Err(exception))) => {
+                                error.push_str(exception.what());
+                                return RECV_RESULT_ERROR
+                            }
+                            Err(Canceled) => {
+                                error.push_str("Cancelled (sender dropped)");
+                                return RECV_RESULT_ERROR
+                            }
+                            Ok(None) => return RECV_RESULT_PENDING,
                         }
                     }
 
                     let waker =
                         CxxCoroutineAddress(UnsafeCell::new(coroutine_address)).into_waker();
                     match Pin::new(&mut self.0).poll(&mut Context::from_waker(&waker)) {
-                        Poll::Ready(Ok(result)) => {
+                        Poll::Ready(Ok(Ok(result))) => {
                             *maybe_result = result;
-                            true
+                            return RECV_RESULT_READY
                         }
-                        Poll::Ready(Err(_)) => todo!(),
-                        Poll::Pending => false,
+                        Poll::Ready(Ok(Err(exception))) => {
+                            error.push_str(exception.what());
+                            return RECV_RESULT_ERROR
+                        }
+                        Poll::Ready(Err(Canceled)) => {
+                            error.push_str("Cancelled (sender dropped)");
+                            return RECV_RESULT_ERROR
+                        }
+                        Poll::Pending => return RECV_RESULT_PENDING,
                     }
                 }
             }
 
             impl Future for [<RustOneshotReceiver $name>] {
-                type Output = $ty;
+                type Output = Result<[<RustOneshotType $name>], Canceled>;
                 fn poll(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
                     match Pin::new(&mut self.0).poll(context) {
                         Poll::Pending => Poll::Pending,
-                        Poll::Ready(value) => Poll::Ready(value.unwrap()),
+                        Poll::Ready(value) => Poll::Ready(value),
                     }
                 }
             }
@@ -168,6 +226,7 @@ macro_rules! define_oneshot {
 // Application code follows:
 
 define_oneshot!(F64, f64);
+//define_oneshot!(F64Result, Result<f64, String>);
 
 static VECTOR_A: [f64; 16384] = [1.0; 16384];
 static VECTOR_B: [f64; 16384] = [2.0; 16384];
@@ -197,18 +256,39 @@ fn rust_dot_product() -> Box<RustOneshotReceiverF64> {
     thread_pool.spawn(go(sender)).unwrap();
     return Box::new(RustOneshotReceiverF64(receiver));
 
-    async fn go(sender: Sender<f64>) {
+    async fn go(sender: Sender<RustOneshotTypeF64>) {
         sender
-            .send(dot_product_inner(&VECTOR_A, &VECTOR_B).await)
+            .send(Ok(dot_product_inner(&VECTOR_A, &VECTOR_B).await))
             .unwrap();
+    }
+}
+
+fn rust_not_product() -> Box<RustOneshotReceiverF64> {
+    let thread_pool = Box::leak(Box::new(ThreadPool::new().unwrap()));
+    let (sender, receiver) = oneshot::channel();
+    thread_pool.spawn(go(sender)).unwrap();
+    return Box::new(RustOneshotReceiverF64(receiver));
+
+    async fn go(sender: Sender<RustOneshotTypeF64>) {
+        sender.send(Err(CxxAsyncException::new("kapow".to_owned().into_boxed_str()))).unwrap();
     }
 }
 
 fn main() {
     // Test Rust calling C++ async functions.
     let receiver = ffi::dot_product();
-    println!("{}", executor::block_on(receiver));
+    println!("{}", executor::block_on(receiver).unwrap().unwrap());
 
     // Test C++ calling Rust async functions.
     ffi::call_rust_dot_product();
+
+    // Test exceptions being thrown by C++ async functions.
+    let receiver = ffi::not_product();
+    match executor::block_on(receiver).unwrap() {
+        Ok(_) => panic!("shouldn't have succeeded!"),
+        Err(err) => println!("{}", err.what()),
+    }
+
+    // Test errors being thrown by Rust async functions.
+    ffi::call_rust_not_product();
 }
