@@ -1,7 +1,7 @@
-// cxx-async/include/example.h
+// cxx-async/include/cppcoro_example.h
 
-#ifndef CXX_ASYNC_EXAMPLE_H
-#define CXX_ASYNC_EXAMPLE_H
+#ifndef CXX_ASYNC_CPPCORO_EXAMPLE_H
+#define CXX_ASYNC_CPPCORO_EXAMPLE_H
 
 #include "cxx_async.h"
 #include "rust/cxx.h"

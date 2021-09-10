@@ -7,6 +7,7 @@ use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
 use futures::executor::{self, ThreadPool};
 use futures::join;
 use futures::task::SpawnExt;
+use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -225,11 +226,38 @@ macro_rules! define_oneshot {
 
 // Application code follows:
 
-define_oneshot!(F64, f64);
-//define_oneshot!(F64Result, Result<f64, String>);
+static THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| ThreadPool::new().unwrap());
 
-static VECTOR_A: [f64; 16384] = [1.0; 16384];
-static VECTOR_B: [f64; 16384] = [2.0; 16384];
+define_oneshot!(F64, f64);
+
+struct Xorshift {
+    state: u32,
+}
+
+impl Xorshift {
+    fn new() -> Xorshift {
+        Xorshift { state: 0x243f6a88 }
+    }
+
+    fn next(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        x
+    }
+}
+
+static VECTORS: Lazy<(Vec<f64>, Vec<f64>)> = Lazy::new(|| {
+    let mut rand = Xorshift::new();
+    let (mut vector_a, mut vector_b) = (vec![], vec![]);
+    for _ in 0..16384 {
+        vector_a.push(rand.next() as f64);
+        vector_b.push(rand.next() as f64);
+    }
+    (vector_a, vector_b)
+});
 
 #[async_recursion]
 async fn dot_product_inner(a: &[f64], b: &[f64]) -> f64 {
@@ -250,23 +278,21 @@ async fn dot_product_inner(a: &[f64], b: &[f64]) -> f64 {
 }
 
 fn rust_dot_product() -> Box<RustOneshotReceiverF64> {
-    // FIXME(pcwalton): Leaking isn't great here.
-    let thread_pool = Box::leak(Box::new(ThreadPool::new().unwrap()));
     let (sender, receiver) = oneshot::channel();
-    thread_pool.spawn(go(sender)).unwrap();
+    THREAD_POOL.spawn(go(sender)).unwrap();
     return Box::new(RustOneshotReceiverF64(receiver));
 
     async fn go(sender: Sender<RustOneshotTypeF64>) {
+        let (ref vector_a, ref vector_b) = *VECTORS;
         sender
-            .send(Ok(dot_product_inner(&VECTOR_A, &VECTOR_B).await))
+            .send(Ok(dot_product_inner(&vector_a, &vector_b).await))
             .unwrap();
     }
 }
 
 fn rust_not_product() -> Box<RustOneshotReceiverF64> {
-    let thread_pool = Box::leak(Box::new(ThreadPool::new().unwrap()));
     let (sender, receiver) = oneshot::channel();
-    thread_pool.spawn(go(sender)).unwrap();
+    THREAD_POOL.spawn(go(sender)).unwrap();
     return Box::new(RustOneshotReceiverF64(receiver));
 
     async fn go(sender: Sender<RustOneshotTypeF64>) {
