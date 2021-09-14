@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <experimental/coroutine>
 #include <optional>
+#include <unifex/await_transform.hpp>
 
 void rust_resume_cxx_coroutine(uint8_t *coroutine_address);
 void rust_destroy_cxx_coroutine(uint8_t *coroutine_address);
@@ -157,6 +158,8 @@ public:
 
     std::experimental::suspend_never initial_suspend() const noexcept { return {}; }
     std::experimental::suspend_never final_suspend() const noexcept { return {}; }
+    
+    std::experimental::coroutine_handle<> unhandled_done() noexcept { return {}; }
 
     void return_value(const RustOneshotResultFor<Channel> &value) {
         m_channel.sender->send(&value, rust::Str());
@@ -170,6 +173,11 @@ public:
         } catch (...) {
             m_channel.sender->send(nullptr, rust::Str("Unhandled C++ exception"));
         }
+    }
+
+    template<typename Value>
+    auto await_transform(Value&& value) noexcept {
+      return unifex::await_transform(*this, (Value&&)value);
     }
 };
 

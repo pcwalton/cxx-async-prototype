@@ -124,14 +124,17 @@ mod ffi {
     unsafe extern "C++" {
         include!("cxx_async.h");
         include!("cppcoro_example.h");
+        include!("libunifex_example.h");
 
         unsafe fn rust_resume_cxx_coroutine(address: *mut u8);
         unsafe fn rust_destroy_cxx_coroutine(address: *mut u8);
 
-        fn dot_product() -> Box<RustOneshotReceiverF64>;
-        fn call_rust_dot_product();
-        fn not_product() -> Box<RustOneshotReceiverF64>;
-        fn call_rust_not_product();
+        fn cppcoro_dot_product() -> Box<RustOneshotReceiverF64>;
+        fn cppcoro_call_rust_dot_product();
+        fn cppcoro_not_product() -> Box<RustOneshotReceiverF64>;
+        fn cppcoro_call_rust_not_product();
+
+        fn libunifex_dot_product() -> Box<RustOneshotReceiverF64>;
     }
 }
 
@@ -300,21 +303,32 @@ fn rust_not_product() -> Box<RustOneshotReceiverF64> {
     }
 }
 
-fn main() {
+fn test_cppcoro() {
     // Test Rust calling C++ async functions.
-    let receiver = ffi::dot_product();
+    let receiver = ffi::cppcoro_dot_product();
     println!("{}", executor::block_on(receiver).unwrap().unwrap());
 
     // Test C++ calling Rust async functions.
-    ffi::call_rust_dot_product();
+    ffi::cppcoro_call_rust_dot_product();
 
     // Test exceptions being thrown by C++ async functions.
-    let receiver = ffi::not_product();
+    let receiver = ffi::cppcoro_not_product();
     match executor::block_on(receiver).unwrap() {
         Ok(_) => panic!("shouldn't have succeeded!"),
         Err(err) => println!("{}", err.what()),
     }
 
     // Test errors being thrown by Rust async functions.
-    ffi::call_rust_not_product();
+    ffi::cppcoro_call_rust_not_product();
+}
+
+fn test_libunifex() {
+    // Test Rust calling C++ async functions.
+    let receiver = ffi::libunifex_dot_product();
+    println!("{}", executor::block_on(receiver).unwrap().unwrap());
+}
+
+fn main() {
+    test_cppcoro();
+    test_libunifex();
 }
