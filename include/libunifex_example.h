@@ -12,8 +12,8 @@
 struct RustOneshotReceiverF64;
 
 rust::Box<RustOneshotReceiverF64> libunifex_dot_product();
-//void libunifex_call_rust_dot_product();
-//rust::Box<RustOneshotReceiverF64> libunifex_not_product();
+void libunifex_call_rust_dot_product();
+rust::Box<RustOneshotReceiverF64> libunifex_not_product();
 //void libunifex_call_rust_not_product();
 
 #endif

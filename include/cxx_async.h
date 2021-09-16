@@ -12,6 +12,9 @@
 void rust_resume_cxx_coroutine(uint8_t *coroutine_address);
 void rust_destroy_cxx_coroutine(uint8_t *coroutine_address);
 
+// Forward declare a libunifex interoperability class so that we can friend it.
+template <typename Channel, typename UnifexReceiver> class RustOperation;
+
 class RustAsyncError : public std::exception {
     std::string m_what;
 
@@ -57,6 +60,9 @@ struct RustOneshotChannelTraits {};
 
 template<typename Channel>
 class RustOneshotAwaiter {
+    template<typename AnotherChannel, typename UnifexReceiver>
+    friend class RustOperation;
+
     typedef RustOneshotReceiverFor<Channel> Receiver;
     typedef RustOneshotResultFor<Channel> Result;
 
@@ -75,8 +81,8 @@ class RustOneshotAwaiter {
     //
     // If `next` is supplied, this method ensures that it will be called when a value becomes
     // ready. If the value is available right now, then this method calls `next` immediately.
-    RecvResult try_recv(std::optional<std::experimental::coroutine_handle<void>> next =
-            std::optional<std::experimental::coroutine_handle<void>>()) noexcept {
+    template<typename NextFn>
+    RecvResult try_recv(std::optional<NextFn> next = std::optional<NextFn>()) noexcept {
         // Require destructor to be called manually.
         union MaybeResult {
             Result some;
@@ -115,12 +121,12 @@ public:
     bool await_ready() noexcept {
         if (m_result || m_error)
             return true;
-        RecvResult ready = try_recv();
+        RecvResult ready = try_recv<std::experimental::coroutine_handle<void>>();
         return ready == RecvResult::Ready || ready == RecvResult::Error;
     }
 
     void await_suspend(std::experimental::coroutine_handle<void> next) {
-        try_recv(std::move(next));
+        try_recv(std::optional(std::move(next)));
     }
 
     Result await_resume() {
@@ -130,7 +136,7 @@ public:
         if (m_error)
             throw *std::move(m_error);
 
-        switch (try_recv()) {
+        switch (try_recv<std::experimental::coroutine_handle<void>>()) {
         case RecvResult::Ready:     return *std::move(m_result);
         case RecvResult::Error:     throw *std::move(m_error);
         case RecvResult::Pending:   break;
