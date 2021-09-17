@@ -2,6 +2,7 @@
 
 #include "cxx-async/src/main.rs.h"
 #include "cxx_async.h"
+#include "cxx_async_cppcoro.h"
 #include "example_common.h"
 #include "rust/cxx.h"
 #include <cassert>
@@ -23,14 +24,6 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-
-// FIXME(pcwalton): Move this into a header.
-template <typename Receiver>
-struct cppcoro::awaitable_traits<rust::Box<Receiver> &&> {
-  typedef RustOneshotResultFor<RustOneshotChannelFor<Receiver>> await_result_t;
-};
-
-// Application code follows:
 
 template <> struct RustOneshotChannelTraits<RustOneshotChannelF64> {};
 

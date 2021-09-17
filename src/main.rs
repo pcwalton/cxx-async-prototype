@@ -135,8 +135,10 @@ mod ffi {
         fn cppcoro_call_rust_not_product();
 
         fn libunifex_dot_product() -> Box<RustOneshotReceiverF64>;
-        fn libunifex_call_rust_dot_product();
+        fn libunifex_call_rust_dot_product_with_coro();
+        fn libunifex_call_rust_dot_product_directly();
         fn libunifex_not_product() -> Box<RustOneshotReceiverF64>;
+        fn libunifex_call_rust_not_product();
     }
 }
 
@@ -330,7 +332,8 @@ fn test_libunifex() {
     println!("{}", executor::block_on(receiver).unwrap().unwrap());
 
     // Test C++ calling Rust async functions.
-    ffi::libunifex_call_rust_dot_product();
+    ffi::libunifex_call_rust_dot_product_with_coro();
+    ffi::libunifex_call_rust_dot_product_directly();
 
     // Test exceptions being thrown by C++ async functions.
     let receiver = ffi::libunifex_not_product();
@@ -338,6 +341,9 @@ fn test_libunifex() {
         Ok(_) => panic!("shouldn't have succeeded!"),
         Err(err) => println!("{}", err.what()),
     }
+
+    // Test errors being thrown by Rust async functions.
+    ffi::libunifex_call_rust_not_product();
 }
 
 fn main() {
