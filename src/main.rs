@@ -125,6 +125,7 @@ mod ffi {
         include!("cxx_async.h");
         include!("cppcoro_example.h");
         include!("libunifex_example.h");
+        include!("folly_example.h");
 
         unsafe fn rust_resume_cxx_coroutine(address: *mut u8);
         unsafe fn rust_destroy_cxx_coroutine(address: *mut u8);
@@ -139,6 +140,11 @@ mod ffi {
         fn libunifex_call_rust_dot_product_directly();
         fn libunifex_not_product() -> Box<RustOneshotReceiverF64>;
         fn libunifex_call_rust_not_product();
+
+        fn folly_dot_product() -> Box<RustOneshotReceiverF64>;
+        fn folly_call_rust_dot_product();
+        fn folly_not_product() -> Box<RustOneshotReceiverF64>;
+        fn folly_call_rust_not_product();
     }
 }
 
@@ -346,7 +352,27 @@ fn test_libunifex() {
     ffi::libunifex_call_rust_not_product();
 }
 
+fn test_folly() {
+    // Test Rust calling C++ async functions.
+    let receiver = ffi::folly_dot_product();
+    println!("{}", executor::block_on(receiver).unwrap().unwrap());
+
+    // Test C++ calling Rust async functions.
+    ffi::folly_call_rust_dot_product();
+
+    // Test exceptions being thrown by C++ async functions.
+    let receiver = ffi::folly_not_product();
+    match executor::block_on(receiver).unwrap() {
+        Ok(_) => panic!("shouldn't have succeeded!"),
+        Err(err) => println!("{}", err.what()),
+    }
+
+    // Test errors being thrown by Rust async functions.
+    ffi::folly_call_rust_not_product();
+}
+
 fn main() {
     test_cppcoro();
     test_libunifex();
+    test_folly();
 }

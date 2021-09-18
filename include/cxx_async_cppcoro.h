@@ -7,7 +7,6 @@
 #include "rust/cxx.h"
 #include <cppcoro/awaitable_traits.hpp>
 
-// FIXME(pcwalton): Move this into a header.
 template <typename Receiver>
 struct cppcoro::awaitable_traits<rust::Box<Receiver> &&> {
   typedef RustOneshotResultFor<RustOneshotChannelFor<Receiver>> await_result_t;
