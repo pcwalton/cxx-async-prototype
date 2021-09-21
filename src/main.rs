@@ -6,11 +6,11 @@ use cxx::CxxString;
 use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
 use futures::executor::{self, ThreadPool};
 use futures::join;
-use futures::task::SpawnExt;
+use futures::task::{Spawn, SpawnExt};
 use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
 use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::future::Future;
 use std::mem::{self, MaybeUninit};
 use std::pin::Pin;
@@ -97,6 +97,14 @@ impl Drop for CxxCoroutineAddress {
             ffi::rust_destroy_cxx_coroutine(mem::replace(&mut *address, ptr::null_mut()))
         }
     }
+}
+
+trait CxxReceiver {
+    type Output;
+    type PlainReceiver;
+    type PlainSender;
+    type CxxSender;
+    fn from_plain_receiver(plain_receiver: Self::PlainReceiver) -> Box<Self>;
 }
 
 #[cxx::bridge]
@@ -258,8 +266,58 @@ macro_rules! define_oneshot {
                     }
                 }
             }
+
+            impl CxxReceiver for [<RustOneshotReceiver $name>] {
+                type Output = $ty;
+                type PlainReceiver = Receiver<[<RustOneshotType $name>]>;
+                type PlainSender = Sender<[<RustOneshotType $name>]>;
+                type CxxSender = [<RustOneshotSender $name>];
+                fn from_plain_receiver(plain_receiver: Self::PlainReceiver) -> Box<Self> {
+                    Box::new([<RustOneshotReceiver $name>](plain_receiver))
+                }
+            }
         }
     };
+}
+
+trait CxxAsync {
+    type Output;
+    fn via<Recv, Exec>(self, executor: &Exec) -> Box<Recv>
+    where
+        Recv: CxxReceiver<
+            Output = Self::Output,
+            PlainReceiver = Receiver<Result<Self::Output, CxxAsyncException>>,
+        >,
+        Exec: Spawn;
+}
+
+impl<Out, Fut> CxxAsync for Fut
+where
+    Fut: Future<Output = Result<Out, CxxAsyncException>> + Send + 'static,
+    Out: Send + Debug + 'static,
+{
+    type Output = Out;
+    fn via<Recv, Exec>(self, executor: &Exec) -> Box<Recv>
+    where
+        Recv: CxxReceiver<
+            Output = Self::Output,
+            PlainReceiver = Receiver<Result<Self::Output, CxxAsyncException>>,
+        >,
+        Exec: Spawn,
+    {
+        let (sender, receiver) = oneshot::channel();
+        executor.spawn(go(sender, self)).unwrap();
+        return CxxReceiver::from_plain_receiver(receiver);
+
+        async fn go<Out, Fut>(sender: Sender<Result<Out, CxxAsyncException>>, fut: Fut)
+        where
+            Fut: Future<Output = Result<Out, CxxAsyncException>>,
+            Out: Debug,
+        {
+            // FIXME(pcwalton): Is it a bad idea to unwrap here?
+            sender.send(fut.await).unwrap();
+        }
+    }
 }
 
 // Application code follows:
@@ -317,46 +375,35 @@ async fn dot_product_inner(a: &[f64], b: &[f64]) -> f64 {
 }
 
 fn rust_dot_product() -> Box<RustOneshotReceiverF64> {
-    let (sender, receiver) = oneshot::channel();
-    THREAD_POOL.spawn(go(sender)).unwrap();
-    return Box::new(RustOneshotReceiverF64(receiver));
-
-    async fn go(sender: Sender<RustOneshotTypeF64>) {
+    async fn go() -> Result<f64, CxxAsyncException> {
         let (ref vector_a, ref vector_b) = *VECTORS;
-        sender
-            .send(Ok(dot_product_inner(&vector_a, &vector_b).await))
-            .unwrap();
+        Ok(dot_product_inner(&vector_a, &vector_b).await)
     }
+
+    go().via(&*THREAD_POOL)
 }
 
 fn rust_not_product() -> Box<RustOneshotReceiverF64> {
-    let (sender, receiver) = oneshot::channel();
-    THREAD_POOL.spawn(go(sender)).unwrap();
-    return Box::new(RustOneshotReceiverF64(receiver));
-
-    async fn go(sender: Sender<RustOneshotTypeF64>) {
-        sender
-            .send(Err(CxxAsyncException::new(
-                "kapow".to_owned().into_boxed_str(),
-            )))
-            .unwrap();
+    async fn go() -> Result<f64, CxxAsyncException> {
+        Err(CxxAsyncException::new("kapow".to_owned().into_boxed_str()))
     }
+
+    go().via(&*THREAD_POOL)
 }
 
-// TODO(pcwalton): Make this a true async fn?
 fn rust_cppcoro_ping_pong(i: i32) -> Box<RustOneshotReceiverString> {
-    let mut string = "".to_owned();
-    if i < 8 {
-        string.push_str(
-            &executor::block_on(ffi::cppcoro_ping_pong(i + 1))
-                .unwrap()
-                .unwrap(),
-        );
+    async fn go(i: i32) -> Result<String, CxxAsyncException> {
+        Ok(format!(
+            "{}ping ",
+            if i < 8 {
+                ffi::cppcoro_ping_pong(i + 1).await.unwrap().unwrap()
+            } else {
+                String::new()
+            }
+        ))
     }
-    string.push_str("ping ");
-    let (sender, receiver) = oneshot::channel();
-    sender.send(Ok(string)).unwrap();
-    Box::new(RustOneshotReceiverString(receiver))
+
+    go(i).via(&*THREAD_POOL)
 }
 
 fn test_cppcoro() {

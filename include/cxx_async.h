@@ -134,6 +134,7 @@ public:
   }
 
   void await_suspend(std::experimental::coroutine_handle<void> next) {
+    // FIXME(pcwalton): This can cause a SEGV!
     try_recv(std::optional(std::move(next)));
   }
 
