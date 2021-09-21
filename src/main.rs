@@ -1,6 +1,6 @@
 // cxx-async/src/main.rs
 
-use crate::ffi::RustOneshotChannelF64;
+use crate::ffi::{RustOneshotChannelF64, RustOneshotChannelString};
 use async_recursion::async_recursion;
 use cxx::CxxString;
 use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
@@ -30,8 +30,12 @@ pub struct CxxAsyncException {
 }
 
 impl CxxAsyncException {
-    pub fn new(what: Box<str>) -> Self { Self { what } }
-    pub fn what(&self) -> &str { &self.what }
+    pub fn new(what: Box<str>) -> Self {
+        Self { what }
+    }
+    pub fn what(&self) -> &str {
+        &self.what
+    }
 }
 
 impl Display for CxxAsyncException {
@@ -95,7 +99,6 @@ impl Drop for CxxCoroutineAddress {
     }
 }
 
-
 #[cxx::bridge]
 mod ffi {
     // Boilerplate for F64
@@ -116,9 +119,28 @@ mod ffi {
         fn channel(self: &RustOneshotReceiverF64) -> RustOneshotChannelF64;
     }
 
+    // Boilerplate for strings
+    pub struct RustOneshotChannelString {
+        pub sender: Box<RustOneshotSenderString>,
+        pub receiver: Box<RustOneshotReceiverString>,
+    }
+    extern "Rust" {
+        type RustOneshotSenderString;
+        type RustOneshotReceiverString;
+        unsafe fn send(self: &mut RustOneshotSenderString, value: *const String, error: &str);
+        unsafe fn recv(
+            self: &mut RustOneshotReceiverString,
+            maybe_result: *mut String,
+            error: Pin<&mut CxxString>,
+            coroutine_address: *mut u8,
+        ) -> i32;
+        fn channel(self: &RustOneshotReceiverString) -> RustOneshotChannelString;
+    }
+
     extern "Rust" {
         fn rust_dot_product() -> Box<RustOneshotReceiverF64>;
         fn rust_not_product() -> Box<RustOneshotReceiverF64>;
+        fn rust_cppcoro_ping_pong(i: i32) -> Box<RustOneshotReceiverString>;
     }
 
     unsafe extern "C++" {
@@ -134,6 +156,7 @@ mod ffi {
         fn cppcoro_call_rust_dot_product();
         fn cppcoro_not_product() -> Box<RustOneshotReceiverF64>;
         fn cppcoro_call_rust_not_product();
+        fn cppcoro_ping_pong(i: i32) -> Box<RustOneshotReceiverString>;
 
         fn libunifex_dot_product() -> Box<RustOneshotReceiverF64>;
         fn libunifex_call_rust_dot_product_with_coro();
@@ -167,7 +190,7 @@ macro_rules! define_oneshot {
                     } else {
                         to_send = Err(CxxAsyncException::new(error.to_owned().into_boxed_str()));
                     }
-                    
+
                     self.0.take().unwrap().send(to_send).unwrap();
                 }
             }
@@ -189,7 +212,8 @@ macro_rules! define_oneshot {
                     if coroutine_address.is_null() {
                         match self.0.try_recv() {
                             Ok(Some(Ok(result))) => {
-                                *maybe_result = result;
+                                ptr::copy_nonoverlapping(&result, maybe_result, 1);
+                                mem::forget(result);
                                 return RECV_RESULT_READY
                             }
                             Ok(Some(Err(exception))) => {
@@ -208,7 +232,8 @@ macro_rules! define_oneshot {
                         CxxCoroutineAddress(UnsafeCell::new(coroutine_address)).into_waker();
                     match Pin::new(&mut self.0).poll(&mut Context::from_waker(&waker)) {
                         Poll::Ready(Ok(Ok(result))) => {
-                            *maybe_result = result;
+                            ptr::copy_nonoverlapping(&result, maybe_result, 1);
+                            mem::forget(result);
                             return RECV_RESULT_READY
                         }
                         Poll::Ready(Ok(Err(exception))) => {
@@ -234,7 +259,7 @@ macro_rules! define_oneshot {
                 }
             }
         }
-    }
+    };
 }
 
 // Application code follows:
@@ -242,6 +267,7 @@ macro_rules! define_oneshot {
 static THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| ThreadPool::new().unwrap());
 
 define_oneshot!(F64, f64);
+define_oneshot!(String, String);
 
 struct Xorshift {
     state: u32,
@@ -309,8 +335,28 @@ fn rust_not_product() -> Box<RustOneshotReceiverF64> {
     return Box::new(RustOneshotReceiverF64(receiver));
 
     async fn go(sender: Sender<RustOneshotTypeF64>) {
-        sender.send(Err(CxxAsyncException::new("kapow".to_owned().into_boxed_str()))).unwrap();
+        sender
+            .send(Err(CxxAsyncException::new(
+                "kapow".to_owned().into_boxed_str(),
+            )))
+            .unwrap();
     }
+}
+
+// TODO(pcwalton): Make this a true async fn?
+fn rust_cppcoro_ping_pong(i: i32) -> Box<RustOneshotReceiverString> {
+    let mut string = "".to_owned();
+    if i < 8 {
+        string.push_str(
+            &executor::block_on(ffi::cppcoro_ping_pong(i + 1))
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    string.push_str("ping ");
+    let (sender, receiver) = oneshot::channel();
+    sender.send(Ok(string)).unwrap();
+    Box::new(RustOneshotReceiverString(receiver))
 }
 
 fn test_cppcoro() {
@@ -330,6 +376,10 @@ fn test_cppcoro() {
 
     // Test errors being thrown by Rust async functions.
     ffi::cppcoro_call_rust_not_product();
+
+    // Ping-pong test.
+    let receiver = ffi::cppcoro_ping_pong(0);
+    println!("{}", executor::block_on(receiver).unwrap().unwrap());
 }
 
 fn test_libunifex() {

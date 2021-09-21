@@ -56,6 +56,19 @@ using RustOneshotResultFor = typename RustOneshotGetResultTypeFromSendFn<
 
 template <typename Channel> struct RustOneshotChannelTraits {};
 
+template<typename T>
+union ManuallyDrop {
+  T m_value;
+  ManuallyDrop() {}
+  ManuallyDrop(T &&value) : m_value(std::move(value)) {}
+  ~ManuallyDrop() {}
+};
+
+template<typename T>
+void forget(T &&value) {
+  ManuallyDrop manually_drop(std::move(value));
+}
+
 template <typename Channel> class RustOneshotAwaiter {
   template <typename AnotherChannel, typename UnifexReceiver>
   friend class RustOperation;
@@ -83,23 +96,18 @@ template <typename Channel> class RustOneshotAwaiter {
   RecvResult try_recv(
       std::optional<std::experimental::coroutine_handle<void>> next =
           std::optional<std::experimental::coroutine_handle<void>>()) noexcept {
-    // Require destructor to be called manually.
-    union MaybeResult {
-      Result some;
-    };
-
     uint8_t *coroutine_address = nullptr;
     if (next)
       coroutine_address = reinterpret_cast<uint8_t *>(next->address());
 
-    MaybeResult maybe_result;
+    ManuallyDrop<Result> maybe_result;
     std::string error;
     auto ready = static_cast<RecvResult>(
-        m_receiver->recv(&maybe_result.some, error, coroutine_address));
+        m_receiver->recv(&maybe_result.m_value, error, coroutine_address));
     switch (ready) {
     case RecvResult::Ready:
-      m_result = std::move(maybe_result.some);
-      maybe_result.some.~Result();
+      m_result = std::move(maybe_result.m_value);
+      maybe_result.m_value.~Result();
       if (next)
         (*next)();
       break;
@@ -173,8 +181,9 @@ public:
 
   std::experimental::coroutine_handle<> unhandled_done() noexcept { return {}; }
 
-  void return_value(const RustOneshotResultFor<Channel> &value) {
+  void return_value(RustOneshotResultFor<Channel> &&value) {
     m_channel.sender->send(&value, rust::Str());
+    forget(std::move(value));
   }
 
   void unhandled_exception() noexcept {
