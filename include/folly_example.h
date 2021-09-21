@@ -15,5 +15,6 @@ rust::Box<RustOneshotReceiverF64> folly_dot_product();
 void folly_call_rust_dot_product();
 rust::Box<RustOneshotReceiverF64> folly_not_product();
 void folly_call_rust_not_product();
+rust::Box<RustOneshotReceiverString> folly_ping_pong(int i);
 
 #endif

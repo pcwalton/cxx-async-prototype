@@ -149,6 +149,7 @@ mod ffi {
         fn rust_dot_product() -> Box<RustOneshotReceiverF64>;
         fn rust_not_product() -> Box<RustOneshotReceiverF64>;
         fn rust_cppcoro_ping_pong(i: i32) -> Box<RustOneshotReceiverString>;
+        fn rust_folly_ping_pong(i: i32) -> Box<RustOneshotReceiverString>;
     }
 
     unsafe extern "C++" {
@@ -176,6 +177,7 @@ mod ffi {
         fn folly_call_rust_dot_product();
         fn folly_not_product() -> Box<RustOneshotReceiverF64>;
         fn folly_call_rust_not_product();
+        fn folly_ping_pong(i: i32) -> Box<RustOneshotReceiverString>;
     }
 }
 
@@ -406,6 +408,21 @@ fn rust_cppcoro_ping_pong(i: i32) -> Box<RustOneshotReceiverString> {
     go(i).via(&*THREAD_POOL)
 }
 
+fn rust_folly_ping_pong(i: i32) -> Box<RustOneshotReceiverString> {
+    async fn go(i: i32) -> Result<String, CxxAsyncException> {
+        Ok(format!(
+            "{}ping ",
+            if i < 8 {
+                ffi::folly_ping_pong(i + 1).await.unwrap().unwrap()
+            } else {
+                String::new()
+            }
+        ))
+    }
+
+    go(i).via(&*THREAD_POOL)
+}
+
 fn test_cppcoro() {
     // Test Rust calling C++ async functions.
     let receiver = ffi::cppcoro_dot_product();
@@ -466,6 +483,10 @@ fn test_folly() {
 
     // Test errors being thrown by Rust async functions.
     ffi::folly_call_rust_not_product();
+
+    // Ping-pong test.
+    let receiver = ffi::folly_ping_pong(0);
+    println!("{}", executor::block_on(receiver).unwrap().unwrap());
 }
 
 fn main() {

@@ -94,3 +94,10 @@ void folly_call_rust_not_product() {
     std::cout << error.what() << std::endl;
   }
 }
+
+rust::Box<RustOneshotReceiverString>
+folly_ping_pong(int i) {
+  std::string string(co_await rust_folly_ping_pong(i + 1));
+  string += "pong ";
+  co_return std::move(string);
+}
